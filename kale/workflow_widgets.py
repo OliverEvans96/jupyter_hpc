@@ -5,6 +5,7 @@
 import time
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
+import cgi
 
 # 3rd party
 import ipywidgets as ipw
@@ -280,7 +281,7 @@ class WorkflowWidget(ipw.HBox):
 
         # Default selections
         self._tab.selected_index = 0
-        self.bqgraph.selected = [0]
+        self.bqgraph.selected = []
         self.nodes = list(self.workflow.dag.nodes())
 
         self._thread_pool = ThreadPoolExecutor()
@@ -312,6 +313,9 @@ class WorkflowWidget(ipw.HBox):
             (self._workflow_readme_html.HTML, 'value'),
             (self.workflow, 'readme')
         )
+
+        # Create futures
+        self.futures = []
 
         # Run updates
         self._update_readme_html()
@@ -445,12 +449,15 @@ class WorkflowWidget(ipw.HBox):
             self._call_read_log()
 
     def _update_metadata_html(self, metadata):
+        # Escape <, >, &, etc. using cgi.escape
+        # Otherwise, metadata string will be
+        # interpreted as literal html.
         html = "<br>".join([
             """
             <b>{key}:</b> {value}
             """.format(
                 key=key,
-                value=value
+                value=cgi.escape(value)
                 )
             for key,value in metadata.items()
         ])
@@ -568,15 +575,8 @@ class WorkflowWidget(ipw.HBox):
         self._read_log(log_path)
 
     def _run_wrapper(self, *args):
-        with self._widget_log:
-            try:
-                self.futures.append(self._thread_pool.submit(self.run_workflow))
-                print("Workflow submitted.")
-            except AttributeError as e:
-                # Attribute error if self.future is None
-                # which means workflow has not been submitted.
-                self.futures = [self._thread_pool.submit(self.run_workflow)]
-                print("Workflow submitted.")
+        self.futures.append(self._thread_pool.submit(self.run_workflow))
+        print("Workflow submitted.")
 
     def run_workflow(self, *args):
         """Run workflow with selected WorkerPool."""
@@ -584,21 +584,29 @@ class WorkflowWidget(ipw.HBox):
         # Disable start job button upon submission
         #self._run_button.disabled = True
 
-        try:
-            pool = self._worker_pool_selector.value
+        #try:
+        pool = self._worker_pool_selector.value
 
-            with self._widget_log:
-                print("Attempting to start job.")
-                if pool is None:
-                    print("No WorkerPool selected.")
-                else:
-                    pool.fw_run(self.workflow)
+        # This causes output to be redirected to "Widget Log"
+        # pane in WorkflowWidget.
+        # Disable for now.
+        # with self._widget_log:
 
-        finally:
+
+        if pool is None:
+            print("No WorkerPool selected.")
+        else:
+            if pool.wf_executor == 'fireworks':
+                pool.fw_run(self.workflow)
+            elif pool.wf_executor == 'parsl':
+                pool.parsl_run(self.workflow)
+
+        #finally:
             # Enable start job button after workflow is finished.
             # (finally ensures reenabling on success or failure)
             #self._run_button.disabled = False
-            pass
+
+            #pass
 
 
 class WorkerPoolWidget(ipw.VBox):
@@ -619,6 +627,9 @@ class WorkerPoolWidget(ipw.VBox):
         self._location_text = ipw.Dropdown(
             options=self.get_locations()
         )
+        self._executor_text = ipw.Dropdown(
+            options=self.get_executors()
+        )
         self._num_workers_text = ipw.IntText(value=1)
         self._new_button = ipw.Button(
             icon="plus",
@@ -627,12 +638,12 @@ class WorkerPoolWidget(ipw.VBox):
 
         self._header = ipw.HTML("<h3>Worker Pools</h3>")
         self.table = kale.aux_widgets.TableWidget(
-            [["<b>Name</b>", "<b>Location</b>",
+            [["<b>Name</b>", "<b>Location</b>", "<b>Executor</b>",
             "<b>Workers</b>", "<b>Action</b>"],
-            [self._name_text, self._location_text,
+            [self._name_text, self._location_text, self._executor_text,
             self._num_workers_text, self._new_button]],
 
-            col_widths=[150, 200, 60, 100]
+            col_widths=[150, 200, 200, 60, 100]
         )
         self._status_bar = ipw.HTML()
 
@@ -640,12 +651,16 @@ class WorkerPoolWidget(ipw.VBox):
         # IntText needs to be 2 pixels smaller than its container
         name_text_width = self.table.col_widths_int[0]-2
         location_text_width = self.table.col_widths_int[1]-2
+        executor_text_width = self.table.col_widths_int[1]-2
         int_text_width = self.table.col_widths_int[2]-2
         self._name_text.layout=ipw.Layout(
             width=u'{}px'.format(name_text_width)
         )
         self._location_text.layout=ipw.Layout(
             width=u'{}px'.format(location_text_width)
+        )
+        self._executor_text.layout=ipw.Layout(
+            width=u'{}px'.format(executor_text_width)
         )
         self._num_workers_text.layout=ipw.Layout(
             width=u'{}px'.format(int_text_width)
@@ -667,13 +682,21 @@ class WorkerPoolWidget(ipw.VBox):
         self._fwconfig = fwconfig
 
         # Add default pool
-        self.add_pool('default', multiprocessing.cpu_count())
+        self.add_pool(
+            name='default',
+            location='localhost',
+            executor='parsl',
+            num_workers=multiprocessing.cpu_count(),
+        )
 
     def get_locations(self):
         """Get locations where workers can be created."""
         return ['localhost'] + list(self.ssh_hosts.keys())
 
-    def add_pool(self, name, num_workers, location='localhost'):
+    def get_executors(self):
+        return ['parsl', 'fireworks']
+
+    def add_pool(self, name, num_workers, executor, location='localhost'):
         """Add WorkerPool with name `name` and `num_workers` workers to widget."""
         # Check for name conflicts
         if name in self._pool_dict.keys():
@@ -684,7 +707,7 @@ class WorkerPoolWidget(ipw.VBox):
         else:
 
             #with self.out_area:
-            pool = kale.workflow_objects.WorkerPool(name, num_workers, self._fwconfig, location)
+            pool = kale.workflow_objects.WorkerPool(name, num_workers, self._fwconfig, location, executor)
 
             remove_button = ipw.Button(
                 description="Remove",
@@ -697,7 +720,7 @@ class WorkerPoolWidget(ipw.VBox):
             )
             self.table.insert_row(
                 -1,
-                [name, location, str(num_workers), remove_button]
+                [name, location, executor, str(num_workers), remove_button]
             )
 
             # Store row information in remove_button so that the
@@ -718,8 +741,14 @@ class WorkerPoolWidget(ipw.VBox):
         """Add worker pool to widget. To be called by button."""
         num_workers = self._num_workers_text.value
         location = self._location_text.value
+        wf_executor = self._executor_text.value
         name = self._name_text.value
-        self.add_pool(name, location=location, num_workers=num_workers)
+        self.add_pool(
+            name,
+            location=location,
+            num_workers=num_workers,
+            executor=wf_executor
+        )
 
         # Reset values
         self._num_workers_text.value = 1

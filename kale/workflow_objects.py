@@ -5,8 +5,8 @@
 import os
 import time
 import yaml
-
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import concurrent.futures as cf
 
 # 3rd party
 import bqplot as bq
@@ -15,9 +15,11 @@ import ipywidgets as ipw
 import traitlets
 import fireworks as fw
 from fireworks.core.rocket_launcher import rapidfire
+import parsl
 
 # local
 import kale.batch_jobs
+from kale.parsl_wrappers import parsl_wrap, parsl_app_after_futures
 
 # TODO - Convert print statements to logging statements
 
@@ -38,16 +40,20 @@ class WorkerPool(traitlets.HasTraits):
 
         self.futures = []
         self.workers = []
-        self.wf_executor = wf_executor
         self.name = name
+        self.num_workers = num_workers
+        self.wf_executor = wf_executor
         self.fwconfig = fwconfig
         self.location = location
         self.log_area = ipw.Output()
 
-        self._add_workers(num_workers)
+        if self.wf_executor == 'fireworks':
+            self._add_workers(num_workers)
 
         if wf_executor == 'fireworks':
             self.init_fireworks()
+        elif wf_executor == 'parsl':
+            self.init_parsl()
 
     def _verify_executor(wf_executor):
         """Verify that given workflow executor is actually
@@ -97,7 +103,7 @@ class WorkerPool(traitlets.HasTraits):
         """Execute workflow in rapidfire with Workers."""
 
         # All workers should concurrently pull jobs.
-        with ThreadPoolExecutor() as executor:
+        with cf.ThreadPoolExecutor() as executor:
             self.futures = []
             for i, worker in enumerate(self.workers):
                 self.log_area.clear_output()
@@ -111,7 +117,7 @@ class WorkerPool(traitlets.HasTraits):
 
     @_verify_executor('fireworks')
     def init_fireworks(self):
-        """Create Fireworks LaunchPad for this workflow."""
+        """Create Fireworks LaunchPad for this pool."""
 
         # TODO - sanity checks on config file
         if self.fwconfig:
@@ -123,6 +129,13 @@ class WorkerPool(traitlets.HasTraits):
 
         # TODO - resetting the FW DB here breaks if everything is not local
         #self.lpad.reset('', require_password=False)
+
+    @_verify_executor('parsl')
+    def init_parsl(self):
+        """Create Parsl excecutors for this pool."""
+        self.parsl_workers = parsl.ThreadPoolExecutor(max_workers=self.num_workers)
+        self.parsl_dfk = parsl.DataFlowKernel(executors=[self.parsl_workers])
+
 
     @_verify_executor('fireworks')
     def _fw_queue(self, workflow):
@@ -155,6 +168,52 @@ class WorkerPool(traitlets.HasTraits):
         print("FQ Queued")
         self._fw_rapidfire(workflow)
         print("FW Completed")
+
+    @_verify_executor('parsl')
+    # TODO: Why do we have two sets of futures? (workflow & task)
+    def parsl_run(self, workflow):
+        """Execute workflow via Parsl.
+        So far, I'm assuming that we're only executing PythonFunctionTasks via Parsl.
+        """
+
+        workflow.futures = dict()
+
+        dag = workflow.gen_subdag()
+
+        # Topological sort guarantees that parent node
+        # appears in list before child.
+        # Therefore, parent futures will exist
+        # before children futures.
+        for task in networkx.dag.topological_sort(dag):
+            # Reset futures before submission
+            task.reset_future()
+
+            # Prepare function to be run by parsl
+            wrapped_func = parsl_wrap(
+                task.func,
+                self.parsl_dfk,
+                *task.args,
+                **task.kwargs
+            )
+
+            # TODO: We have two levels of futures on the workflow
+            # (not considering the ones on the tasks)
+            # This is why I'm using .result() in the depends = [...]
+            # It seems to work, but we should do a sanity check.
+            # there could be a simpler way with only one level.
+
+            # Determine dependencies
+            depends = [
+                workflow.futures[dep].result()
+                for dep in task.dependencies[workflow] if dep in dag
+            ]
+
+            # Submit functions to Parsl & save futures
+            workflow.futures[task] = parsl_app_after_futures(
+                wrapped_func,
+                depends,
+                self.parsl_dfk,
+            )
 
 
 class Worker(traitlets.HasTraits):
@@ -205,6 +264,10 @@ class Workflow(traitlets.HasTraits):
         # Workflow executor - to be defined on initialization of wf executor.
         self.wf_executor = None
 
+    def get_future(self, index):
+        """Return future containing result from task with given index."""
+        return self.index_dict[index].future
+
     def example_from_dag(self, dag):
         """
         Generate an example workflow from a DAG of numbers.
@@ -234,6 +297,29 @@ class Workflow(traitlets.HasTraits):
             else:
                 self.add_task(tasks[i])
 
+    def add_dependencies(self, task, dependencies):
+        """Store dependency relationship in DAG.
+        Appends dependencies to those already in place.
+        """
+
+        print("Adding deps: {} <- {}".format(task, dependencies))
+
+        for dependency in dependencies:
+            self.dag.add_edge(dependency, task)
+
+        # Store dependency relationships in all involved nodes
+        if task.dependencies[self]:
+            task.dependencies[self] += dependencies
+        else:
+            task.dependencies[self] = dependencies
+
+        for dependency in dependencies:
+            # Create child list for this workflow if not present
+            if self not in dependency.children.keys():
+                dependency.children[self] = [task]
+            else:
+                dependency.children[self].append(task)
+
     def add_task(self, task, dependencies=None):
         """
         Add instantiated Task object to the Workflow.
@@ -257,27 +343,14 @@ class Workflow(traitlets.HasTraits):
         task.index[self] = index
         self.index_dict[index] = task
 
-        if dependencies is not None:
-            # Store dependency relationship in DAG
-            for dependency in dependencies:
-                self.dag.add_edge(dependency, task)
-
-            # Store dependency relationships in all involved nodes
-            task.dependencies[self] = dependencies
-
-            for dependency in dependencies:
-                # Create child list for this workflow if not present
-                if self not in dependency.children.keys():
-                    dependency.children[self] = [task]
-                else:
-                    dependency.children[self].append(task)
-
-        # Write empty list to dependency dict if none exist
-        else:
-            task.dependencies[self] = []
-
+        # Initialize empty dependency list
+        task.dependencies[self] = []
         # Tasks cannot have children at definition time.
         task.children[self] = []
+
+        # Add dependencies if they are provided now
+        if dependencies:
+            self.add_dependencies(task, dependencies)
 
         # Pass tag information to workflow
         self._task_add_tags(task, task.tags)
@@ -347,6 +420,7 @@ class Workflow(traitlets.HasTraits):
             }
             for node in self.dag.nodes()
         ]
+
         link_data = [
             {
                 'source': source.index[self],
@@ -358,6 +432,7 @@ class Workflow(traitlets.HasTraits):
         xs = bq.LinearScale()
         ys = bq.LinearScale()
         scales = {'x': xs, 'y': ys}
+
 
         graph = bq.Graph(
             node_data=node_data,
@@ -397,7 +472,7 @@ class Workflow(traitlets.HasTraits):
         toolbar = bq.Toolbar(figure=fig)
 
         return ipw.VBox([fig, toolbar])
-    
+
     def check_selection_for_dependency_gaps(self):
         """
         It's okay for a selcted task to have a parent or child
@@ -432,8 +507,9 @@ class Workflow(traitlets.HasTraits):
 
             # Add each node in selection
             for node_index in self._bqgraph.selected:
-                # Identify task by index
+                # Identify task by index and add to graph
                 node = self.index_dict[node_index]
+                subdag.add_node(node)
                 # Identify parent in main DAG
                 parent_list = list(self.dag.predecessors(node))
                 for parent in parent_list:
@@ -552,9 +628,11 @@ class Task(traitlets.HasTraits):
         self._firework = None
 
     def get_user_dict(self):
-        """Generate dictionary of user field names and values"""
+        """Generate dictionary of user field names
+        and their corresponding string representations."""
+
         return {
-            field: getattr(self, field)
+            field: str(getattr(self, field))
             for field in self.user_fields
         }
 
@@ -626,7 +704,7 @@ class NotebookTask(Task):
     If false, notebook will be executed without opening,
     and Workflow will continue upon successful execution.
     """
-    
+
     randhash = traitlets.Unicode(allow_none=True)
 
     def __init__(self, name, interactive=True, **kwargs):
@@ -703,11 +781,13 @@ class PythonFunctionTask(Task):
     """Python function call to be executed as a Workflow step."""
     def __init__(self, name, func, args=[], kwargs={}, **other_kwargs):
         # Actual callable function to be executed.
-        self.func = func
+        #self.func = func
+        self.func = self.wrap_func(func)
         self.args = args
         self.kwargs = kwargs
+        self.future = cf.Future()
 
-        user_fields = ['func.__name__', 'args', 'kwargs']
+        user_fields = ['args', 'kwargs']
 
         super().__init__(
             name=name,
@@ -726,6 +806,58 @@ class PythonFunctionTask(Task):
             args=self.args,
             kwargs=self.kwargs
         )
+
+    def reset_future(self):
+        """Replace self.future with a new Future.
+        This should be called upon workflow submission."""
+        #print("future before: {}".format(self.future))
+        self.future = cf.Future()
+        #print("future after: {} \n now = {}".format(self.future, datetime.now()))
+
+    def parse_args(self, args, kwargs):
+        """Replace any Task in args or kwargs with the result of their future.
+        This should be called immediately before execution."""
+        import time
+
+        #print("""Parsing args: {}
+        #now = {}
+        #task = {}""".format(args, datetime.now(), self))
+        new_args = []
+        for arg in args:
+            if isinstance(arg, Task):
+                #print("before result.")
+                new_args.append(arg.future.result())
+                #print("after result.")
+            else:
+                new_args.append(arg)
+
+        #print("Parsing kwargs: {}".format(kwargs))
+        new_kwargs = dict()
+        for key, val in kwargs.items():
+            if isinstance(val, Task):
+                new_kwargs[key] = val.future.result()
+            else:
+                new_kwargs[key] = val
+
+        return new_args, new_kwargs
+
+    def wrap_func(self, func):
+        """Wrap the function so that any futures in `args` or `kwargs`
+        are replaced by their results,
+        AND that the return value of this function will be
+        accessible via PythonFunctionTask.future.result().
+
+        NOTE: This will almost certainly break Fireworks execution.
+        because it relies on func.__name__. Not 100% sure.
+        """
+        def wrapper(*args, **kwargs):
+            new_args, new_kwargs = self.parse_args(args, kwargs)
+
+            # This is where function execution occurs.
+            result = func(*new_args, **new_kwargs)
+            self.future.set_result(result)
+
+        return wrapper
 
 class BatchTask(Task):
     """Task which will be submitted to a batch queue to execute."""
